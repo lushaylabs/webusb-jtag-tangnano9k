@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>WebUSB</title>
+        <style>
+            * {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            }
+            #deviceConnected {
+                background: rgb(13, 98, 255);
+                color: #FFF;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+                text-transform: uppercase;
+                font-weight: bold;
+            }
+            #deviceInfo {
+                margin-top: 16px;
+                border: 1px solid #CCC;
+                padding: 8px;
+                border-radius: 4px;
+                width: fit-content;
+                min-width: 300px;
+                padding: 5px 10px;
+                font-size: 13px;
+            }
+            #deviceInfo * {
+                margin: 0;
+                color: #444;
+                margin: 6px 0;
+            }
+            #deviceInfo span {
+                color: #000;
+                font-weight: bold;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>WebUSB Tests</h1>
+        <button id="connectBtn">Connect</button>
+        <p>Device Connected: <span id="deviceConnected">None</span></p>
+        <button id="descriptorsBtn">Get Device Info</button>
+        <section id="deviceInfo"></section>
+        <script>
+            const connectBtn = document.getElementById('connectBtn');
+            const descriptorsBtn = document.getElementById('descriptorsBtn');
+            const deviceConnected = document.getElementById('deviceConnected');
+            const deviceInfo = document.getElementById('deviceInfo');
+            
+            let device = null;
+            
+            function setDevice(newDevice) {
+                if (newDevice) {
+                    device = newDevice;
+                    deviceConnected.innerText = 'Yes';
+                } else {
+                    device = null;
+                    deviceConnected.innerText = 'None';
+                }
+            }    
+
+            function sleep(ms) {
+                return new Promise(resolve => setTimeout(resolve, ms));
+            }
+        
+            connectBtn.addEventListener('click', async () => {
+                const newDevice = await navigator.usb.requestDevice({ filters: [] });
+                setDevice(newDevice);
+                await initMPSSE();
+                await setupMPSSE();
+                const code = await getIDCode();
+                const codeInHex = code.reverse().map((byte) => {
+                    return byte.toString(16).padStart(2, '0');
+                }).join('');
+                console.log(codeInHex);
+                deviceInfo.innerText = `ID Code: ${codeInHex}`;
+            });
+
+            async function initMPSSE() {
+                // Reset ftdi port
+                await sendUSBCommand({ request: 0x00, value: 0x0000, index: 0x00 });
+                // Set baud rate 115200
+                await sendUSBCommand({ request: 0x03, value: 0x001a, index: 0x00 });
+                // Set latency timer to 8ms
+                await sendUSBCommand({ request: 0x09, value: 0x0008, index: 0x00 });
+                // Set MPSSE mode
+                await sendUSBCommand({ request: 0x0b, value: 0x0200, index: 0x00 });
+                // Flush RX buffer
+                await sendUSBCommand({ request: 0x00, value: 0x0001, index: 0x00 });
+                // Flush TX buffer
+                await sendUSBCommand({ request: 0x00, value: 0x0002, index: 0x00 });
+            }
+
+            async function setupMPSSE() {
+                await sendMPSSECommand([
+                    0x86, 0x00, 0x00, // Disable clock divisor
+                ]);
+                await sendMPSSECommand([
+                    0x80, 0x08, 0x0b, // Setup lower ftdi bits
+                    0x82, 0x08, 0x0b, // Setup upper ftdi bits 
+                    0x87              // Send immediate
+                ]);
+                await sendMPSSECommand([
+                    0x4B, 0x05, 0x1F, // Reset TAP state machine
+                ]);
+            }
+
+            async function getIDCode() {
+                await sendMPSSECommand([
+                    0x4B, 0x03, 0x03,  // move to shift IR
+                    0x87               // send immediate
+                ]);
+                await sendMPSSECommand([
+                    0x1B, 0x06, 0x11,  // shift in instruction 0x11 (lower 7 bits)
+                    0x4B, 0x00, 0x01,  // shift in highest bit moving to exit1 ir
+                    0x87               // send immediate
+                ]);
+                await sendMPSSECommand([
+                    0x4B, 0x01, 0x01,  // move to run test idle
+                    0x87,              // send immediate
+                ]);       
+                await sendMPSSECommand([       
+                    0x4B, 0x04, 0x00,  // poll for 5 clock cycles in run test idle
+                    0x87               // send immediate
+                ]);
+                await sendMPSSECommand([
+                    0x4B, 0x02, 0x01, // move to shift dr
+                    0x87              // send immediate
+                ])
+                await sendMPSSECommand([
+                    0x39, 0x02, 0x00, 0x00, 0x00, 0x00, // read 3 bytes of our ID code via TDO
+                    0x87              // send immediate
+                ]);
+                // responses are delayed by 1 transmission
+                const first3Bytes = await sendMPSSECommand([
+                    0x3B, 0x06, 0xFF, // read another 7 bits of our ID code
+                    0x6B, 0x00, 0x01, // read the last bit and move to exit1 dr
+                    0x87              // send immediate
+                ]);
+                const lastByteRes = await sendMPSSECommand([
+                    0x4B, 0x01, 0x01, // move to run test idle
+                    0x87              // send immediate
+                ]);
+                const bytes = first3Bytes.slice(2);
+                const upperBit = lastByteRes[lastByteRes.length - 1];
+                const lowerBits = lastByteRes[lastByteRes.length - 2];
+                const lastByte = (upperBit & (1 << 7)) | (lowerBits >> 1);
+                return [...bytes, lastByte];
+            }
+
+            async function sendMPSSECommand(data) {
+                if (!device) { return; }
+                await device.open();
+                await device.claimInterface(device.configuration.interfaces[0].interfaceNumber);
+                const writeRes = await device.transferOut(2, new Uint8Array(data));
+                const readRes = await device.transferIn(1, 64);
+                await device.close();
+                return readRes.data?.buffer ? Array.from(new Uint8Array(readRes.data?.buffer)) : [];
+            }
+
+            document.addEventListener('DOMContentLoaded', async () => {
+                const devices = await navigator.usb.getDevices();
+                if (devices.length > 0) {
+                    setDevice(devices[0]);
+                }
+            });
+
+            async function getDescriptor(descriptorType, descriptorIndex, descriptorLength) {
+                if (!device) { return; }
+                await device.open();
+                const res = await device.controlTransferIn({
+                    requestType: 'standard',
+                    recipient: 'device',
+                    request: 0x06,
+                    value: descriptorType,
+                    index: descriptorIndex,
+                    length: descriptorLength
+                }, descriptorLength);
+                const responseBytes = new Uint8Array(res.data.buffer);
+                await device.close();
+                return responseBytes;
+            }
+
+            async function sendUSBCommand(command) {
+                if (!device) { return; }
+                await device.open();
+                await device.controlTransferOut({
+                    requestType: command.requestType || 'vendor',
+                    recipient: 'device',
+                    request: command.request,
+                    value: command.value || 0x00,
+                    index: command.index || 0x00
+                });
+                await device.close();
+            }
+
+            async function getStringFromStringDescriptor(stringDescriptorIndex) {
+                if (stringDescriptorIndex === 0) { return ''; }
+                const descriptorBytes = await getDescriptor(0x0300 | stringDescriptorIndex, 0x0409, 255);
+                if (!descriptorBytes) { return ''; }
+                let decodedString = '';
+                for (let i = 2; i < descriptorBytes.length; i += 2) {
+                    const charCode = descriptorBytes[i] | (descriptorBytes[i + 1] << 8);
+                    if (charCode === 0) { break; }
+                    decodedString += String.fromCharCode(charCode);
+                }
+                return decodedString;
+            }
+
+            const DESCRIPTOR_TYPE_NAMES = {
+                0x01: 'Device',
+                0x02: 'Configuration',
+                0x03: 'String',
+                0x04: 'Interface',
+                0x05: 'Endpoint'
+            }
+
+            async function getDeviceDescriptor() {
+                const bytes = await getDescriptor(0x0100, 0x00, 0x12);
+                return {
+                    bLength: bytes[0],
+                    bDescriptorType: bytes[1],
+                    descriptorTypeName: DESCRIPTOR_TYPE_NAMES[bytes[1]],
+                    bcdUSB: bytes[2] + (bytes[3] << 8),
+                    bDeviceClass: bytes[4],
+                    bDeviceSubClass: bytes[5],
+                    bDeviceProtocol: bytes[6],
+                    bMaxPacketSize0: bytes[7],
+                    idVendor: bytes[8] + (bytes[9] << 8),
+                    idProduct: bytes[10] + (bytes[11] << 8),
+                    bcdDevice: bytes[12] + (bytes[13] << 8),
+                    iManufacturer: bytes[14],
+                    iProduct: bytes[15],
+                    iSerialNumber: bytes[16],
+                    bNumConfigurations: bytes[17]
+                }
+            }
+
+            async function getConfigurationDescriptor() {
+                let bytes = await getDescriptor(0x0200, 0x00, 0x09);
+                const length = bytes[2] + (bytes[3] << 8)
+                bytes = await getDescriptor(0x0200, 0x00, length);
+
+                const interfaceDescriptors = [];
+                let lastInterface = null
+
+                for (let i = 9; i < bytes.length; ) {
+                    const descriptorLength = bytes[i];
+                    const descriptor = bytes.slice(i, i + descriptorLength);
+                    const descriptorType = descriptor[1];
+                    const descriptorTypeName = DESCRIPTOR_TYPE_NAMES[descriptorType];
+
+                    if (descriptorTypeName === 'Interface') {
+                        const interfaceDescriptor = {
+                            bLength: descriptor[0],
+                            bDescriptorType: descriptor[1],
+                            bInterfaceNumber: descriptor[2],
+                            bAlternateSetting: descriptor[3],
+                            bNumEndpoints: descriptor[4],
+                            bInterfaceClass: descriptor[5],
+                            bInterfaceSubClass: descriptor[6],
+                            bInterfaceProtocol: descriptor[7],
+                            iInterface: descriptor[8],
+                            interfaceName: await getStringFromStringDescriptor(descriptor[8]),
+                            endpoints: []
+                        }
+                        interfaceDescriptors.push(interfaceDescriptor);
+                        lastInterface = interfaceDescriptor;
+                    } else if (descriptorTypeName === 'Endpoint') {
+                        const endpointDescriptor = {
+                            bLength: descriptor[0],
+                            bDescriptorType: descriptor[1],
+                            bEndpointAddress: descriptor[2],
+                            bmAttributes: descriptor[3],
+                            wMaxPacketSize: descriptor[4] + (descriptor[5] << 8),
+                            bInterval: descriptor[6]
+                        }
+                        lastInterface.endpoints.push(endpointDescriptor);
+                    }
+
+                    i += descriptorLength;
+                }
+
+                return {
+                    bLength: bytes[0],
+                    bDescriptorType: bytes[1],
+                    descriptorTypeName: DESCRIPTOR_TYPE_NAMES[bytes[1]],
+                    wTotalLength: length,
+                    bNumInterfaces: bytes[4],
+                    bConfigurationValue: bytes[5],
+                    iConfiguration: bytes[6],
+                    bmAttributes: bytes[7],
+                    bMaxPower: bytes[8],
+                    interfaceDescriptors
+                }
+            }
+
+            function htmlList(parent) {
+                const list = document.createElement('ul');
+                list.addRow = (label) => {
+                    const row = document.createElement('li');
+                    row.innerHTML = label;
+                    list.appendChild(row);
+                    return row;
+                }
+                parent.appendChild(list);
+                return list;
+            }
+
+            descriptorsBtn.addEventListener('click', async () => {
+                if (!device) { return; }
+              
+                const deviceDescriptor = await getDeviceDescriptor();
+                const manufacturerName = await getStringFromStringDescriptor(deviceDescriptor.iManufacturer);
+                const productName = await getStringFromStringDescriptor(deviceDescriptor.iProduct);
+                const serialNumber = await getStringFromStringDescriptor(deviceDescriptor.iSerialNumber);
+
+                const vendorId = deviceDescriptor.idVendor.toString(16).padStart(4, '0');
+                const productId = deviceDescriptor.idProduct.toString(16).padStart(4, '0');
+
+                const configurationDescriptor = await getConfigurationDescriptor();
+
+                deviceInfo.innerHTML = ''
+                deviceInfo.addText = (key, val) => {
+                    const p = document.createElement('p');
+                    const label = document.createElement('span');
+                    label.innerText = key + ': ';
+                    p.appendChild(label);
+                    p.appendChild(document.createTextNode(val));
+                    deviceInfo.appendChild(p);
+                }
+
+                deviceInfo.addText('Manufacturer Name', manufacturerName);
+                deviceInfo.addText('Product Name', productName);
+                deviceInfo.addText('Serial Number', serialNumber);
+                deviceInfo.addText('Number of Interfaces', configurationDescriptor.bNumInterfaces);
+                deviceInfo.addText('Vendor ID', `0x${vendorId}`);
+                deviceInfo.addText('Product ID', `0x${productId}`);
+                deviceInfo.addText('Interface Tree', '');
+                
+                const interfaceTree = htmlList(deviceInfo);
+                
+                for (const interfaceDescriptor of configurationDescriptor.interfaceDescriptors) {
+                    const interfaceTitle = `Interface ${interfaceDescriptor.bInterfaceNumber}: ${interfaceDescriptor.interfaceName}`;
+                    const interfaceRow = interfaceTree.addRow(interfaceTitle);
+
+                    const endpointTree = htmlList(interfaceRow);
+
+                    for (const endpointDescriptor of interfaceDescriptor.endpoints) {
+                        const endpointTitle = `Endpoint ${endpointDescriptor.bEndpointAddress & 0x0F}:`;
+                        const endpointItem = endpointTree.addRow(endpointTitle);
+
+                        const endpointInfo = htmlList(endpointItem);
+                        const endpointDirection = endpointDescriptor.bEndpointAddress & 0x80 ? 'In' : 'Out';
+                        endpointInfo.addRow(`Direction: ${endpointDirection}`);
+                        endpointInfo.addRow(`Max Packet Size ${endpointDescriptor.wMaxPacketSize}`);
+                    }
+                }
+            });
+        </script>
+    </body>
+</html>
