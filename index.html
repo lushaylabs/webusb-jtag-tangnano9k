@@ -34,9 +34,38 @@
                 color: #000;
                 font-weight: bold;
             }
+            #notSupported {
+                display: none;
+                height: 50px;
+                background: #FFF;
+                z-index: 100;
+                align-items: center;
+                justify-content: center;
+                flex-direction: column;
+                text-align: center;
+                background:  rgb(193, 0, 0);
+                position: absolute;
+                bottom: 0;
+                right: 0;
+                padding: 10px;
+                left: 0;
+                color: #FFF;
+            }
+            #notSupported h1 {
+                font-size: 20px;
+                margin: 0;
+            }
+            #notSupported p {
+                font-size: 14px;
+                margin: 0;
+            }
         </style>
     </head>
     <body>
+        <div id="notSupported">
+            <h1>WebUSB is not supported in this browser</h1>
+            <p>Try using the latest Chrome or Edge</p>
+        </div>
         <h1>WebUSB Tests</h1>
         <button id="connectBtn">Connect</button>
         <p>Device Connected: <span id="deviceConnected">None</span></p>
@@ -160,6 +189,10 @@
             }
 
             document.addEventListener('DOMContentLoaded', async () => {
+                if (!navigator.usb) {
+                    document.getElementById('notSupported').style.display = 'flex';
+                    return;
+                }
                 const devices = await navigator.usb.getDevices();
                 if (devices.length > 0) {
                     setDevice(devices[0]);
